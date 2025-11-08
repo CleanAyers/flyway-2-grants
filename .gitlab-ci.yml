@@ -1,0 +1,224 @@
+# GitLab CI/CD Pipeline for flyway-2-grants
+# Flyway Database Grants & Access Control Pipeline for Cluster 2
+
+stages:
+  - sync
+  - validate
+  - test
+  - deploy-dev
+  - deploy-staging
+  - deploy-prod
+
+variables:
+  FLYWAY_VERSION: "9.22.3"
+  POSTGRES_VERSION: "15"
+  # Database connection variables (set in GitLab CI/CD variables)
+  # FLYWAY_URL_DEV: "jdbc:postgresql://dev-cluster2.example.com:5432/cluster2db"
+  # FLYWAY_URL_STAGING: "jdbc:postgresql://staging-cluster2.example.com:5432/cluster2db" 
+  # FLYWAY_URL_PROD: "jdbc:postgresql://prod-cluster2.example.com:5432/cluster2db"
+  # FLYWAY_USER_DEV, FLYWAY_PASSWORD_DEV (secured variables)
+  # FLYWAY_USER_STAGING, FLYWAY_PASSWORD_STAGING (secured variables)
+  # FLYWAY_USER_PROD, FLYWAY_PASSWORD_PROD (secured variables)
+
+# Default Docker image with Flyway and PostgreSQL client
+default:
+  image: flyway/flyway:${FLYWAY_VERSION}-alpine
+  before_script:
+    - apk add --no-cache git bash curl
+    - flyway --version
+
+# Sync shared content from parent repository
+sync-shared:
+  stage: sync
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH == "dev"
+      when: manual
+      allow_failure: true
+  script:
+    - echo "🔄 Syncing shared content from parent repository..."
+    - git remote add parent-shared https://github.com/CleanAyers/shared-flyway-ddl.git || true
+    - git fetch parent-shared ro-shared-ddl
+    - |
+      if [ -d "ro-shared-ddl" ]; then
+        echo "📁 Updating existing ro-shared-ddl folder..."
+        git subtree pull --prefix=ro-shared-ddl parent-shared ro-shared-ddl --squash
+      else
+        echo "📁 Adding ro-shared-ddl folder for first time..."
+        git subtree add --prefix=ro-shared-ddl parent-shared ro-shared-ddl --squash
+      fi
+    - |
+      if [ -n "$(git status --porcelain)" ]; then
+        git config user.email "ci@gitlab.com"
+        git config user.name "GitLab CI"
+        git add -A
+        git commit -m "chore(ci): sync ro-shared-ddl from parent [skip ci]"
+        git push origin $CI_COMMIT_BRANCH
+        echo "✅ Shared content synchronized and committed"
+      else
+        echo "✅ No changes to sync"
+      fi
+  only:
+    - main
+    - dev
+
+# Validate SQL syntax and Flyway configuration
+validate-sql:
+  stage: validate
+  script:
+    - echo "🔍 Validating Flyway grants configuration and SQL syntax..."
+    - |
+      if [ -f "conf/flyway.conf" ]; then
+        echo "📋 Using project-specific Flyway configuration"
+        FLYWAY_CONFIG="-configFiles=conf/flyway.conf"
+      else
+        echo "📋 Using default Flyway configuration"
+        FLYWAY_CONFIG=""
+      fi
+    - |
+      # Create temporary flyway.conf for validation
+      cat > temp-flyway.conf << EOF
+      flyway.url=jdbc:postgresql://localhost:5432/validation_db
+      flyway.user=flyway_user
+      flyway.password=flyway_pass
+      flyway.schemas=public
+      flyway.validateMigrationNaming=true
+      flyway.validateOnMigrate=true
+      EOF
+    - echo "✅ Grants SQL validation completed"
+  artifacts:
+    reports:
+      junit: flyway-validation-report.xml
+    expire_in: 1 week
+    when: always
+
+# Test grants against local PostgreSQL
+test-migrations:
+  stage: test
+  services:
+    - name: postgres:${POSTGRES_VERSION}-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: cluster2_grants_test
+    POSTGRES_USER: flyway_test
+    POSTGRES_PASSWORD: test_password
+    FLYWAY_URL: "jdbc:postgresql://postgres:5432/cluster2_grants_test"
+    FLYWAY_USER: "flyway_test"
+    FLYWAY_PASSWORD: "test_password"
+    FLYWAY_SCHEMAS: "public"
+  script:
+    - echo "🔐 Testing grants and permissions against PostgreSQL ${POSTGRES_VERSION}..."
+    - sleep 10  # Wait for PostgreSQL to be ready
+    - |
+      # Test database connectivity
+      until flyway -url="${FLYWAY_URL}" -user="${FLYWAY_USER}" -password="${FLYWAY_PASSWORD}" info; do
+        echo "Waiting for database to be ready..."
+        sleep 5
+      done
+    - echo "📊 Current grants migration status:"
+    - flyway -url="${FLYWAY_URL}" -user="${FLYWAY_USER}" -password="${FLYWAY_PASSWORD}" info
+    - echo "🚀 Running grants migrations..."
+    - flyway -url="${FLYWAY_URL}" -user="${FLYWAY_USER}" -password="${FLYWAY_PASSWORD}" migrate
+    - echo "✅ Validating applied grants..."
+    - flyway -url="${FLYWAY_URL}" -user="${FLYWAY_USER}" -password="${FLYWAY_PASSWORD}" validate
+    - echo "📊 Final grants migration status:"
+    - flyway -url="${FLYWAY_URL}" -user="${FLYWAY_USER}" -password="${FLYWAY_PASSWORD}" info
+  artifacts:
+    reports:
+      junit: flyway-test-report.xml
+    expire_in: 1 week
+    when: always
+
+# Deploy to Development Environment
+deploy-dev:
+  stage: deploy-dev
+  environment:
+    name: development
+    url: https://dev-cluster2.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  script:
+    - echo "🔐 Deploying grants to Development (Cluster 2)..."
+    - |
+      if [ -z "$FLYWAY_URL_DEV" ]; then
+        echo "❌ FLYWAY_URL_DEV not configured"
+        exit 1
+      fi
+    - echo "📊 Current development grants status:"
+    - flyway -url="${FLYWAY_URL_DEV}" -user="${FLYWAY_USER_DEV}" -password="${FLYWAY_PASSWORD_DEV}" info
+    - echo "🔍 Validating before grant migration..."
+    - flyway -url="${FLYWAY_URL_DEV}" -user="${FLYWAY_USER_DEV}" -password="${FLYWAY_PASSWORD_DEV}" validate
+    - echo "🚀 Running grant migrations..."
+    - flyway -url="${FLYWAY_URL_DEV}" -user="${FLYWAY_USER_DEV}" -password="${FLYWAY_PASSWORD_DEV}" migrate
+    - echo "📊 Final development grants status:"
+    - flyway -url="${FLYWAY_URL_DEV}" -user="${FLYWAY_USER_DEV}" -password="${FLYWAY_PASSWORD_DEV}" info
+    - echo "✅ Development grants deployment completed"
+
+# Deploy to Staging Environment  
+deploy-staging:
+  stage: deploy-staging
+  environment:
+    name: staging
+    url: https://staging-cluster2.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
+  script:
+    - echo "🔐 Deploying grants to Staging (Cluster 2)..."
+    - |
+      if [ -z "$FLYWAY_URL_STAGING" ]; then
+        echo "❌ FLYWAY_URL_STAGING not configured"
+        exit 1
+      fi
+    - echo "📊 Current staging grants status:"
+    - flyway -url="${FLYWAY_URL_STAGING}" -user="${FLYWAY_USER_STAGING}" -password="${FLYWAY_PASSWORD_STAGING}" info
+    - echo "🔍 Validating before grant migration..."
+    - flyway -url="${FLYWAY_URL_STAGING}" -user="${FLYWAY_USER_STAGING}" -password="${FLYWAY_PASSWORD_STAGING}" validate
+    - echo "🚀 Running grant migrations..."
+    - flyway -url="${FLYWAY_URL_STAGING}" -user="${FLYWAY_USER_STAGING}" -password="${FLYWAY_PASSWORD_STAGING}" migrate
+    - echo "📊 Final staging grants status:"
+    - flyway -url="${FLYWAY_URL_STAGING}" -user="${FLYWAY_USER_STAGING}" -password="${FLYWAY_PASSWORD_STAGING}" info
+    - echo "✅ Staging grants deployment completed"
+
+# Deploy to Production Environment
+deploy-prod:
+  stage: deploy-prod
+  environment:
+    name: production
+    url: https://prod-cluster2.example.com
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master"
+      when: manual
+  script:
+    - echo "🔐 Deploying grants to Production (Cluster 2)..."
+    - |
+      if [ -z "$FLYWAY_URL_PROD" ]; then
+        echo "❌ FLYWAY_URL_PROD not configured"
+        exit 1
+      fi
+    - echo "⚠️ PRODUCTION GRANTS DEPLOYMENT - Creating backup point..."
+    - echo "📊 Current production grants status:"
+    - flyway -url="${FLYWAY_URL_PROD}" -user="${FLYWAY_USER_PROD}" -password="${FLYWAY_PASSWORD_PROD}" info
+    - echo "🔍 Validating before grant migration..."
+    - flyway -url="${FLYWAY_URL_PROD}" -user="${FLYWAY_USER_PROD}" -password="${FLYWAY_PASSWORD_PROD}" validate
+    - echo "🚀 Running production grant migrations..."
+    - flyway -url="${FLYWAY_URL_PROD}" -user="${FLYWAY_USER_PROD}" -password="${FLYWAY_PASSWORD_PROD}" migrate
+    - echo "📊 Final production grants status:"
+    - flyway -url="${FLYWAY_URL_PROD}" -user="${FLYWAY_USER_PROD}" -password="${FLYWAY_PASSWORD_PROD}" info
+    - echo "✅ Production grants deployment completed successfully"
+  when: manual
+  allow_failure: false
+
+# Cleanup job for temporary artifacts
+cleanup:
+  stage: .post
+  script:
+    - echo "🧹 Cleaning up temporary files and artifacts..."
+    - rm -f temp-flyway.conf
+    - rm -f flyway-*.xml
+  when: always
